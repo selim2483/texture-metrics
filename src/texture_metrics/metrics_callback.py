@@ -1,35 +1,28 @@
-from datetime import datetime
-from dataclasses import asdict, dataclass, field, is_dataclass
-from pathlib import Path
-import time
-from typing import Any, Callable, Iterable, List, Optional, Tuple
-from functools import wraps
-import statistics
+from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 from torch.utils.data import DataLoader
-import yaml
 
 from .criteria import fourier
 from .criteria import gradients
 from .criteria import optimal_transport
 from .criteria import style_distances
 from .criteria import CNN, CNNOptions, RandomTripletDataset
-from .transforms import get_stats, get_transform
-from .utils import add_suffixe, format_time, merge_dict, set_seed, stdev
+from .transforms import get_stats
 
 
-_metric_dict = dict()
+metric_dict = dict()
 
 def is_valid_metric(metric):
-    return metric in _metric_dict
+    return metric in metric_dict
 
 def list_valid_metrics():
-    return list(_metric_dict.keys())
+    return list(metric_dict.keys())
 
 def register_metric(func: Callable):
     assert callable(func)
-    _metric_dict[func.__name__] = func
+    metric_dict[func.__name__] = func
     
     return func
 
