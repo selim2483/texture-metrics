@@ -59,8 +59,11 @@ def normalize(tensor: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: normalized image.
     """
+    if tensor.shape[1] == 1:
+        tensor = tensor.repeat((1, 3, 1, 1))
+        
     mean = torch.as_tensor(
-        MEAN if tensor.shape[1]==3 else [.5 for _ in range(tensor.shape[1])], 
+        MEAN if tensor.shape[1] == 3 else [.5 for _ in range(tensor.shape[1])], 
         dtype=tensor.dtype, device=tensor.device
     ).view(-1, 1, 1)
     tensor = tensor / 2 + .5
