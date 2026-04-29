@@ -101,7 +101,11 @@ class CNN(torch.nn.Module):
         
     def forward(self, x: torch.Tensor):
         self.model(normalize(x))
-        return [self.outputs[key] for key in self.options.layers]
+        outputs = [self.outputs[key] for key in self.options.layers]
+        # Set computed features maps to None to save memory when not using CNN
+        for key in self.options.layers:
+            self.outputs[key] = None
+        return outputs
     
 # ----------------------------- Random triplet ----------------------------- #
 
