@@ -93,11 +93,11 @@ class StyleDistance(Metric):
                 **self.kwargs,
             ).sum(dim=0)
             if self.contributions:
-                getattr(self, f) += res[-1]
+                setattr(self, f, getattr(self, f) + res[-1])
                 for i in range(self.num_levels):
-                    getattr(self, f"{f}_{i}") += res[i]
+                    setattr(self, f"{f}_{i}", getattr(self, f"{f}_{i}") + res[i])
             else:
-                getattr(self, f) += res
+                setattr(self, f, getattr(self, f) + res)
 
         total_time = time.time() - start_time
         self.time += total_time
@@ -167,11 +167,11 @@ class StochasticStyleDistance(StyleDistance):
         results = results.sum(dim=0) / len(triplet_generator)
         for f in self.features:
             if self.contributions:
-                getattr(self, f) += results[-1]
+                setattr(self, f, getattr(self, f) + results[-1])
                 for i in range(self.num_levels):
-                    getattr(self, f"{f}_{i}") += results[i]
+                    setattr(self, f"{f}_{i}", getattr(self, f"{f}_{i}") + results[i])
             else:
-                getattr(self, f) += results
+                setattr(self, f, getattr(self, f) + results)
 
         total_time = time.time() - start_time
         self.time += total_time
@@ -334,7 +334,7 @@ def spectral_radial_distance(target: torch.Tensor, synth: torch.Tensor):
 
 
 @register_metric
-def gradients_distance(
+def gradients_magnitude_distance(
     target: torch.Tensor,
     synth: torch.Tensor,
     nslice: Optional[int],
@@ -351,13 +351,9 @@ def gradients_distance(
     Returns:
         dict: dictionnary containing gradients distances.
     """
-    dt_x, dt_y, dt = gradients.image_gradient(target)
-    ds_x, ds_y, ds = gradients.image_gradient(synth)
-    return {
-        "dx": distribution_distances(dt_x, ds_x, nslice=nslice, batch_size=batch_size),
-        "dy": distribution_distances(dt_y, ds_y, nslice=nslice, batch_size=batch_size),
-        "dmag": distribution_distances(dt, ds, nslice=nslice, batch_size=batch_size),
-    }
+    _, _, dt = gradients.image_gradient(target)
+    _, _, ds = gradients.image_gradient(synth)
+    return distribution_distances(dt, ds, nslice=nslice, batch_size=batch_size)
 
 
 class SimpleDistance(Metric):
@@ -388,6 +384,44 @@ class SimpleDistance(Metric):
             torch.Tensor: the average distance over all samples.
         """
         return self.distance / self.count
+
+class DictDistance(Metric):
+    def __init__(self, dist_fn: Callable | str, name: Optional[str], nbands: int = 3, kwargs: dict = {}):
+        if isinstance(dist_fn, str):
+            self.dist_fn = _metric_dict[dist_fn]
+
+        if name is None:
+            name = dist_fn.__name__
+        self.name = name
+
+        self.kwargs = kwargs
+
+        dummy_target = torch.randn(1, nbands, 64, 64)
+        dummy_synth = torch.randn(1, nbands, 64, 64)
+        dummy_output, _ = self.dist_fn(dummy_target, dummy_synth)
+        self.keys = dummy_output.keys()
+        for k in self.keys:
+            self.add_state(k, default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0), dist_reduce_fx="sum")
+
+    def update(self, target: torch.Tensor, synth: torch.Tensor):
+        values, time = self.dist_fn(target, synth, **self.kwargs)
+        for k,v in values.items():
+            setattr(self, k, getattr(self, k) + target.size(0) * v)
+        self.count += target.size(0)
+        self.time += time
+
+    def compute(self) -> torch.Tensor:
+        """Compute the final metric value.
+
+        Returns:
+            torch.Tensor: the average distance over all samples.
+        """
+        results = {}
+        for k in self.keys:
+            results[k] = getattr(self, k) / self.count
+        return results
 
 
 def compute_metrics(metrics: List[Metric], reset: bool = True) -> dict:
@@ -433,7 +467,7 @@ def metrics_loop(
                     if nimg is not None and img_count >= nimg:
                         break
 
-                    output = model(batch)
+                    output = model(batch, **kwargs)
 
                     for metric in metrics:
                         metric.update(output["sample"], output["target"])
