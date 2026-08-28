@@ -38,6 +38,7 @@ class CNN(torch.nn.Module):
     ):
         super().__init__()
         self.architecture = architecture
+        self.weights = weights
         self.layers = layers or LAYERS[self.architecture][0]
         self.layers_weights = layers_weights or LAYERS[self.architecture][1]
 

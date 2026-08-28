@@ -4,7 +4,7 @@ from functools import wraps
 import json
 from pathlib import Path
 import time
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from texture_metrics.utils.logging import progress_bar
 from texture_metrics.utils.seed import (
@@ -20,7 +20,6 @@ from torch.utils.data import DataLoader
 from .criteria import weighted_feature_distance
 from .criteria import gradients, fourier, optimal_transport
 from .criteria.cnn import CNN, RandomTripletDataset
-from .transforms import get_stats
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = False
@@ -45,6 +44,7 @@ class StyleDistance(Metric):
         compile: bool = True,
         **kwargs,
     ):
+        super().__init__()
         self.name = name
         self.features = features
         self.contributions = contributions
@@ -211,8 +211,8 @@ def register_metric(func: Callable):
 def distribution_distances(
     target: torch.Tensor,
     synth: torch.Tensor,
-    nslice: Optional[int],
-    batch_size: Optional[int],
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
 ):
     """Computes distribution distances (band-wise Wasserstein
     distance and SWD) between target and synthetic images.
@@ -225,6 +225,7 @@ def distribution_distances(
     Returns:
         dict: dictionnary containing the distribution distances.
     """
+    print(f"nslice = {nslice}, batch_size = {batch_size}")
     return {
         "swd": optimal_transport.sliced_wasserstein_distance(
             target, synth, nslice=nslice, batch_size=batch_size
@@ -242,8 +243,8 @@ def distribution_distances(
 def sliced_wasserstein_distance(
     target: torch.Tensor,
     synth: torch.Tensor,
-    nslice: Optional[int],
-    batch_size: Optional[int],
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
 ):
     """Computes Sliced Wasserstein Distance (SWD) between target and
     synthetic images.
@@ -265,8 +266,8 @@ def sliced_wasserstein_distance(
 def histograms(
     target: torch.Tensor,
     synth: torch.Tensor,
-    nslice: Optional[int],
-    batch_size: Optional[int],
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
 ):
     """Computes histogram distances.
 
@@ -279,6 +280,30 @@ def histograms(
         dict: dictionnary containing histogram distances.
     """
     return distribution_distances(target, synth, nslice=nslice, batch_size=batch_size)
+
+
+def get_stats(tnsr: torch.Tensor, cholesky=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute first and second order statistics of an image.
+
+    Args:
+        tnsr (torch.Tensor): input image
+        cholesky (bool, optional): Computes and return Cholesky
+            decomposition of the covariance matrix.
+            Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: mean and
+            covariance/Cholesky decomposition
+    """
+    tnsr = tnsr.flatten(start_dim=-2)
+    mu = tnsr.mean(dim=-1, keepdim=True)
+    tnsr = tnsr - mu
+    cov = tnsr @ tnsr.transpose(-1, -2) / tnsr.shape[-1]
+    if cholesky:
+        l = torch.linalg.cholesky(cov)
+        return mu.squeeze(-1), l
+    else:
+        return mu.squeeze(-1), cov
 
 
 @register_metric
@@ -337,8 +362,8 @@ def spectral_radial_distance(target: torch.Tensor, synth: torch.Tensor):
 def gradients_magnitude_distance(
     target: torch.Tensor,
     synth: torch.Tensor,
-    nslice: Optional[int],
-    batch_size: Optional[int],
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
 ):
     """Computes gradients distribution distances (along x and y axis
     and magnitude).
@@ -358,6 +383,8 @@ def gradients_magnitude_distance(
 
 class SimpleDistance(Metric):
     def __init__(self, dist_fn: Callable | str, name: Optional[str], kwargs: dict = {}):
+        super().__init__()
+
         if isinstance(dist_fn, str):
             self.dist_fn = _metric_dict[dist_fn]
 
@@ -387,11 +414,13 @@ class SimpleDistance(Metric):
 
 class DictDistance(Metric):
     def __init__(self, dist_fn: Callable | str, name: Optional[str], nbands: int = 3, kwargs: dict = {}):
+        super().__init__()
+
         if isinstance(dist_fn, str):
             self.dist_fn = _metric_dict[dist_fn]
 
         if name is None:
-            name = dist_fn.__name__
+            name = self.dist_fn.__name__
         self.name = name
 
         self.kwargs = kwargs
