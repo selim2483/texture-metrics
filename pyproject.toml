@@ -2,7 +2,7 @@
 authors = [{name = "Sélim Ollivier", email = "selim.ollivier@onera.fr"}]
 dependencies = ["idr-torch>=2.5.0,<3"]
 name = "texture-metrics"
-requires-python = ">= 3.11"
+requires-python = ">= 3.10"
 version = "0.1.0"
 
 [build-system]
