@@ -1,6 +1,6 @@
 [project]
 authors = [{name = "Sélim Ollivier", email = "selim.ollivier@onera.fr"}]
-dependencies = []
+dependencies = ["idr-torch>=2.5.0,<3"]
 name = "texture-metrics"
 requires-python = ">= 3.11"
 version = "0.1.0"
@@ -21,3 +21,6 @@ texture_metrics = { path = ".", editable = true }
 [tool.pixi.dependencies]
 pyyaml = ">=6.0.3,<7"
 matplotlib = ">=3.10.7,<4"
+huggingface_hub = ">=1.28.0,<2"
+ruff = ">=0.16.4,<0.17"
+wandb = ">=0.28.2,<0.29"

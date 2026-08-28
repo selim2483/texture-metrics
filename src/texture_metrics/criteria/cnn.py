@@ -8,36 +8,14 @@ from typing import Iterable, List, Optional, Union
 import torch
 from torch.utils.data import Dataset
 
-from .style_distances import gramm
 from ..constants import LAYERS
-from ..utils import normalize
+from ..utils.utils import normalize
 
-@dataclass
-class CNNOptions:
-    """Model options of the CNN"""
-    # Architecture of the CNN (vgg[11,13,16,19], resnet[34,50], 
-    # googlenet)
-    architecture: str = 'vgg19'
-    # Weights of the CNN. 
-    # If None, use random initialization. 
-    # If 'imagenet', use ImageNet default pretrained weights. 
-    # Else, should be the path of the pickle containing the
-    # pretrained weights.
-    weights: str = 'imagenet'
-    # Layers to extract for Gram matrices
-    layers: Optional[List[int]] = None
-    # Weights $w_l$ of the quadratic differences between Gram matrices 
-    layers_weights: Optional[List[float]] = None
-    
-    def __post_init__(self):
-        self.layers = self.layers or LAYERS[self.architecture][0]
-        self.layers_weights = (
-            self.layers_weights or LAYERS[self.architecture][1])
-        
+
 # ---------------------------------- Model --------------------------------- #
 
-def get_module_recursive(
-    module: torch.nn.Module, layer: Union[str, Iterable]):
+
+def get_module_recursive(module: torch.nn.Module, layer: Union[str, Iterable]):
     if isinstance(layer, str):
         return module._modules[layer]
     elif isinstance(layer, int):
@@ -45,40 +23,49 @@ def get_module_recursive(
     elif len(layer) == 1:
         return get_module_recursive(module, layer[0])
     else:
-        return get_module_recursive(
-            get_module_recursive(module, layer[0]), layer[1:])
-    
+        return get_module_recursive(get_module_recursive(module, layer[0]), layer[1:])
+
+
 class CNN(torch.nn.Module):
     """Wrapper class of CNN for texture synthesis."""
-    def __init__(self, options: CNNOptions):
+
+    def __init__(
+        self,
+        architecture: str = "vgg19",
+        weights: str = "imagenet",
+        layers: Optional[List[int]] = None,
+        layers_weights: Optional[List[float]] = None,
+    ):
         super().__init__()
-        self.options = options
-        weights = 'DEFAULT' if self.options.weights == 'imagenet' else None
-        if self.options.architecture == 'vgg11':
+        self.architecture = architecture
+        self.layers = layers or LAYERS[self.architecture][0]
+        self.layers_weights = layers_weights or LAYERS[self.architecture][1]
+
+        weights = "DEFAULT" if weights == "imagenet" else None
+        if self.architecture == "vgg11":
             self.model = models.vgg11(weights=weights).features
-        elif self.options.architecture == 'vgg13':
+        elif self.architecture == "vgg13":
             self.model = models.vgg13(weights=weights).features
-        elif self.options.architecture == 'vgg16':
+        elif self.architecture == "vgg16":
             self.model = models.vgg16(weights=weights).features
-        elif self.options.architecture == 'vgg19':
+        elif self.architecture == "vgg19":
             self.model = models.vgg19(weights=weights).features
-            if Path(self.options.weights).is_file():
+            if Path(self.weights).is_file():
                 self.model = models.vgg19().features
                 try:
-                    pretrained_dict = torch.load(
-                        self.options.weights)["state_dict_extractor"]
+                    pretrained_dict = torch.load(self.weights)["state_dict_extractor"]
                     self.model.load_state_dict(pretrained_dict)
                 except:
-                    pretrained_dict = torch.load(self.options.weights)
+                    pretrained_dict = torch.load(self.weights)
                     for param, item in zip(
-                        self.model.parameters(), pretrained_dict.keys()):
-                        param.data = pretrained_dict[item].type(
-                            torch.FloatTensor)
-        elif self.options.architecture == 'resnet34':
+                        self.model.parameters(), pretrained_dict.keys()
+                    ):
+                        param.data = pretrained_dict[item].type(torch.FloatTensor)
+        elif self.architecture == "resnet34":
             self.model = models.resnet34(weights=weights)
-        elif self.options.architecture == 'resnet50':
+        elif self.architecture == "resnet50":
             self.model = models.resnet50(weights=weights)
-        elif self.options.architecture == 'googlenet':
+        elif self.architecture == "googlenet":
             self.model = models.googlenet(weights=weights)
 
         self.model.requires_grad_(False)
@@ -92,22 +79,26 @@ class CNN(torch.nn.Module):
             # The hook signature
             def hook(module, module_in, module_out):
                 self.outputs[name] = module_out
+
             return hook
 
         # Register hook on each layer with index on array "layers"
-        for layer in self.options.layers:
-            handle = get_module_recursive(
-                self.model, layer).register_forward_hook(save_output(layer))
-        
+        for layer in self.layers:
+            handle = get_module_recursive(self.model, layer).register_forward_hook(
+                save_output(layer)
+            )
+
     def forward(self, x: torch.Tensor):
         self.model(normalize(x))
-        outputs = [self.outputs[key] for key in self.options.layers]
+        outputs = [self.outputs[key] for key in self.layers]
         # Set computed features maps to None to save memory when not using CNN
-        for key in self.options.layers:
+        for key in self.layers:
             self.outputs[key] = None
         return outputs
-    
+
+
 # ----------------------------- Random triplet ----------------------------- #
+
 
 class RandomTripletDataset(Dataset):
     """Dataset to sample random triplets."""
@@ -122,20 +113,15 @@ class RandomTripletDataset(Dataset):
 
     def __getitem__(self, index):
         return torch.tensor(self.channels[index])
-    
+
     def __len__(self):
         return len(self.channels)
-    
+
+
 class InfiniteSampler(torch.utils.data.Sampler):
     def __init__(
-            self, 
-            dataset, 
-            rank         = 0, 
-            num_replicas = 1, 
-            shuffle      = True, 
-            seed         = 0, 
-            window_size  = 0.5
-        ):
+        self, dataset, rank=0, num_replicas=1, shuffle=True, seed=0, window_size=0.5
+    ):
         assert len(dataset) > 0
         assert num_replicas > 0
         assert 0 <= rank < num_replicas
@@ -160,7 +146,7 @@ class InfiniteSampler(torch.utils.data.Sampler):
         idx = 0
         while True:
             i = idx % order.size
-            if idx % self.num_replicas==self.rank:
+            if idx % self.num_replicas == self.rank:
                 yield order[i]
             if window >= 2:
                 j = (i - rnd.randint(window)) % order.size
