@@ -29,7 +29,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     yaml = None
 
-from utils.distributed import get_global_rank
+from .distributed import get_global_rank
 
 
 def generate_unique_run_name(base_name: str, save_dir: str) -> str:
