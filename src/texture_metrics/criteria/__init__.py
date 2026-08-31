@@ -1,4 +1,4 @@
-from .cnn import CNN, CNNOptions, RandomTripletDataset
+from .cnn import CNN, RandomTripletDataset
 from .fourier import (
     spectral_orthogonal_distance1D,
     sliced_spectral_orthogonal_distance,
