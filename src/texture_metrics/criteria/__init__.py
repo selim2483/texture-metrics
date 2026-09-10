@@ -5,6 +5,8 @@ from .fourier import (
     spectral_radial_distance,
     sliced_spectral_radial_distance,
     radial_profile,
+    spectral_slope,
+    spectral_polynomial_embedding,
 )
 from .gradients import image_gradient
 from .optimal_transport import (

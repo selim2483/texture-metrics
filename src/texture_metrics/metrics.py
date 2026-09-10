@@ -243,7 +243,7 @@ def distribution_distances(
 
 
 @register_metric
-def sliced_wasserstein_distance(
+def sliced_wasserstein_distance_image(
     target: torch.Tensor,
     synth: torch.Tensor,
     nslice: Optional[int] = 1,

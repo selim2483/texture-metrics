@@ -225,3 +225,142 @@ def sliced_spectral_radial_distance(
 ) -> torch.Tensor:
     fn = sliced_distance(spectral_radial_distance, nslice, batch_size)
     return fn(x, y, p=p) ** (1 / p)
+
+
+# --------------------------- Spectral slope/embedding ---------------------- #
+
+
+def truncate_spectrum(
+    fp: torch.Tensor,
+    r: torch.Tensor,
+    quantile: float = 0.01,
+    keep: str = "high",
+):
+    """Truncates a Fourier spectrum, keeping only the frequencies
+    above/below a quantile of the radial frequency `r`.
+
+    Args:
+        fp (torch.Tensor): spectrum modulus.
+        r (torch.Tensor): radial frequency, same shape as `fp`.
+        quantile (float, optional): quantile threshold. No truncation
+            if 0.0. Defaults to 0.01.
+        keep (str, optional): "high" or "low" frequencies. Defaults
+            to "high".
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: truncated (r, fp).
+    """
+    if quantile > 0.0:
+        threshold = torch.quantile(r, quantile)
+        if keep == "high":
+            idx = r >= threshold
+        elif keep == "low":
+            idx = r <= threshold
+        else:
+            raise ValueError(f"Unknown keep direction: {keep}")
+    else:
+        idx = torch.ones_like(r, dtype=torch.bool)
+
+    fp = torch.where(fp == 0, torch.ones_like(fp) * 1e-8, fp)[idx]
+    r = torch.where(r == 0, torch.ones_like(r), r)[idx].unsqueeze(-1)
+    return r, fp
+
+
+def spectral_slope(
+    img_fft: torch.Tensor, quantile: float = 0.9, keep: str = "high"
+):
+    """Estimates the slope of the (log-log) azimuthally averaged
+    power spectrum, i.e. how fast spectral energy decays with
+    frequency.
+
+    Args:
+        img_fft (torch.Tensor): Fourier transform of the image(s),
+            shape (B, C, H, W).
+        quantile (float, optional): quantile of radial frequencies
+            kept for the fit. Defaults to 0.9.
+        keep (str, optional): "high" or "low" frequencies. Defaults
+            to "high".
+
+    Returns:
+        torch.Tensor: spectral slope, shape (B,).
+    """
+    b, _, h, w = img_fft.shape
+    fy = torch.fft.fftfreq(
+        h, device=img_fft.device, dtype=torch.float32
+    ).reshape(-1, 1)
+    fx = torch.fft.fftfreq(
+        w, device=img_fft.device, dtype=torch.float32
+    ).reshape(1, -1)
+    r = torch.sqrt(fy**2 + fx**2).repeat(b, 1, 1) * (h * w) ** 0.5
+
+    fp = img_fft.mean(dim=-3).abs()
+
+    r, fp = truncate_spectrum(fp, r, quantile, keep=keep)
+    logx = torch.log(r).reshape(b, -1)
+    logy = torch.log(fp).reshape(b, -1)
+    mlogx = logx.mean(dim=-1, keepdim=True)
+    mlogy = logy.mean(dim=-1, keepdim=True)
+
+    beta = torch.sum((logx - mlogx) * (logy - mlogy), dim=-1) / torch.sum(
+        (logx - mlogx) ** 2, dim=-1
+    )
+
+    return beta.squeeze()
+
+
+def spectral_polynomial_embedding(
+    img_fft: torch.Tensor,
+    quantile: float = 0.9,
+    polynomial_order: int = 1,
+    dtype: torch.dtype = torch.float32,
+):
+    """Fits a polynomial to the (log-log) azimuthally averaged power
+    spectrum, per channel, and returns the fitted coefficients as an
+    embedding.
+
+    Args:
+        img_fft (torch.Tensor): Fourier transform of the image(s),
+            shape (B, C, H, W).
+        quantile (float, optional): quantile of radial frequencies
+            kept for the fit. Defaults to 0.9.
+        polynomial_order (int, optional): order of the fitted
+            polynomial. Defaults to 1.
+        dtype (torch.dtype, optional): unused, kept for API
+            compatibility. Defaults to torch.float32.
+
+    Returns:
+        torch.Tensor: polynomial coefficients, shape
+            (B, C, polynomial_order + 1).
+    """
+    b, c, h, w = img_fft.shape
+    fy = torch.fft.fftfreq(
+        h, device=img_fft.device, dtype=torch.float32
+    ).reshape(-1, 1)
+    fx = torch.fft.fftfreq(
+        w, device=img_fft.device, dtype=torch.float32
+    ).reshape(1, -1)
+    r = torch.sqrt(fy**2 + fx**2).repeat(b, c, 1, 1) * (h * w) ** 0.5
+
+    fp = img_fft.abs()
+
+    if quantile > 0.0:
+        threshold = torch.quantile(r, quantile)
+        idx = r >= threshold
+    else:
+        idx = torch.ones_like(r, dtype=torch.bool)
+    r = r[idx].unsqueeze(-1).reshape(b, c, -1, 1)
+    r = torch.where(r == 0, torch.ones_like(r), r)
+    logr = torch.log(r).reshape(b, c, -1, 1)
+    logx = torch.cat(
+        [torch.ones_like(logr)]
+        + [torch.pow(logr, i) for i in range(1, polynomial_order + 1)],
+        dim=-1,
+    )
+    logy = torch.log(fp[idx]).reshape(b, c, -1).unsqueeze(-1)
+    beta = (
+        torch.inverse(logx.transpose(-2, -1) @ logx)
+        @ logx.transpose(-2, -1)
+        @ logy
+    ).reshape(b, c, -1)
+
+    return beta
