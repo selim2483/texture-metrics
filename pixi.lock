@@ -5,6 +5,8 @@ environments:
     - url: https://conda.anaconda.org/conda-forge/
     indexes:
     - https://pypi.org/simple
+    options:
+      pypi-prerelease-mode: if-necessary-or-explicit
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-4_kmp_llvm.conda
@@ -2096,12 +2098,11 @@ packages:
   timestamp: 1762941572482
 - pypi: ./
   name: texture-metrics
-  version: 0.1.0
-  sha256: 1a1ed2a525d774db3aad7cf91b461da8c60cb8535c8856ecaf6bb24389ed485e
+  version: 0.1.1
+  sha256: d245cc1e929710eed1f182dd99e6552ddacef4c89af6b88c38481921fb1ba77b
   requires_dist:
   - idr-torch>=2.5.0,<3
-  requires_python: '>=3.11'
-  editable: true
+  requires_python: '>=3.10'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_hd72426e_102.conda
   sha256: a84ff687119e6d8752346d1d408d5cf360dee0badd487a472aa8ddedfdc219e1
   md5: a0116df4f4ed05c303811a837d5b39d8

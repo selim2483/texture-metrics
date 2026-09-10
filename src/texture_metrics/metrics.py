@@ -1,22 +1,189 @@
+import csv
 from datetime import datetime
-from dataclasses import asdict, dataclass, field, is_dataclass
+from functools import wraps
+import json
 from pathlib import Path
 import time
-from typing import Any, Callable, Iterable, List, Optional, Tuple
-from functools import wraps
-import statistics
+from typing import Callable, Iterable, List, Optional, Tuple
+
+from texture_metrics.utils.logging import progress_bar
+from texture_metrics.utils.seed import (
+    collect_rng_states,
+    seed_everything,
+    set_rng_states,
+)
 
 import torch
+from torchmetrics import Metric
 from torch.utils.data import DataLoader
-import yaml
 
-from .criteria import fourier
-from .criteria import gradients
-from .criteria import optimal_transport
-from .criteria import style_distances
-from .criteria import CNN, CNNOptions, RandomTripletDataset
-from .transforms import get_stats, get_transform
-from .utils.utils import add_suffixe, format_time, merge_dict, set_seed, stdev
+from .criteria import weighted_feature_distance
+from .criteria import gradients, fourier, optimal_transport
+from .criteria.cnn import CNN, RandomTripletDataset
+from .transforms import get_transform
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as file:
+        json.dump(payload, file, indent=2)
+
+
+class StyleDistance(Metric):
+    def __init__(
+        self,
+        cnn: Optional[CNN | dict] = None,
+        features: Iterable[str] = ["mean", "gram", "covariance"],
+        contributions: bool = True,
+        transform: Optional[Callable] = None,
+        transform_name: Optional[str] = None,
+        transform_path: Optional[str | Path] = None,
+        name: str = "style_distance",
+        compile: bool = True,
+        **kwargs,
+    ):
+        super().__init__()
+        self.name = name
+        self.features = features
+        self.contributions = contributions
+        if transform is not None:
+            self.transform = transform
+        else:
+            self.transform = get_transform(transform_name, transform_path)
+        self.kwargs = kwargs
+
+        if isinstance(cnn, dict):
+            cnn = CNN(**cnn)
+        self.cnn = cnn
+
+        if compile:
+            self.cnn.compile()
+
+        dummy_tensor = torch.randn(1, 3, 256, 256)
+        dummy_output = cnn(dummy_tensor)
+        self.num_levels = len(dummy_output)
+        for f in self.features:
+            self.add_state(f, default=torch.tensor(0.0), dist_reduce_fx="sum")
+            if self.contributions:
+                for i in range(self.num_levels):
+                    self.add_state(
+                        f"{f}_{i}", default=torch.tensor(0.0), dist_reduce_fx="sum"
+                    )
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0, dtype=torch.float32), dist_reduce_fx="sum")
+
+    def update(
+        self,
+        target: torch.Tensor,
+        synth: torch.Tensor,
+        cnn: Optional[CNN] = None,
+    ):
+        start_time = time.time()
+        cnn = cnn or self.cnn
+
+        target_outputs = cnn(self.transform(target))
+        synth_outputs = cnn(self.transform(synth))
+
+        for f in self.features:
+            res = weighted_feature_distance(
+                synth_outputs,
+                target_outputs,
+                f,
+                weights=cnn.layers_weights,
+                contributions=self.contributions,
+                **self.kwargs,
+            ).sum(dim=0)
+            if self.contributions:
+                setattr(self, f, getattr(self, f) + res[-1])
+                for i in range(self.num_levels):
+                    setattr(self, f"{f}_{i}", getattr(self, f"{f}_{i}") + res[i])
+            else:
+                setattr(self, f, getattr(self, f) + res)
+
+        total_time = time.time() - start_time
+        self.time += total_time
+        self.count += target.size(0)
+
+    def compute(self) -> dict[str, torch.Tensor]:
+        metrics = {}
+        for f in self.features:
+            metrics[f] = getattr(self, f) / self.count
+            if self.contributions:
+                for i in range(self.num_levels):
+                    metrics[f"{f}_{i}"] = getattr(self, f"{f}_{i}") / self.count
+
+        return metrics
+
+
+class StochasticStyleDistance(StyleDistance):
+    def __init__(
+        self,
+        cnn=None,
+        features=["mean", "gram", "covariance"],
+        contributions: bool = True,
+        transform: Optional[Callable] = None,
+        transform_name: Optional[str] = None,
+        transform_path: Optional[str | Path] = None,
+        name="stochastic_style_distance",
+        compile=True,
+        batch_size: int = 1,
+        **kwargs,
+    ):
+        super().__init__(
+            cnn, features, contributions, transform, transform_name, transform_path, name, compile, **kwargs
+        )
+        self.batch_size = batch_size
+
+    def update(
+        self,
+        target: torch.Tensor,
+        synth: torch.Tensor,
+        cnn: Optional[CNN] = None,
+    ):
+        start_time = time.time()
+        cnn = cnn or self.cnn
+        b, c, h, w = target.shape
+        triplet_generator = DataLoader(
+            RandomTripletDataset(c), batch_size=self.batch_size
+        )
+
+        results = torch.zeros(
+            len(self.features),
+            1 + self.contributions * self.num_levels,
+            device=target.device,
+        )
+        for channels in triplet_generator:
+            target_outputs = cnn(target[..., channels, :, :].reshape(-1, 3, h, w))
+            synth_outputs = cnn(synth[..., channels, :, :].reshape(-1, 3, h, w))
+            for i, f in enumerate(self.features):
+                results[i].add_(
+                    weighted_feature_distance(
+                        synth_outputs,
+                        target_outputs,
+                        f,
+                        weights=cnn.layers_weights,
+                        contributions=self.contributions,
+                        **self.kwargs,
+                    ).sum(dim=0)
+                )
+
+        results = results / len(triplet_generator)
+        for i, f in enumerate(self.features):
+            if self.contributions:
+                setattr(self, f, getattr(self, f) + results[i, -1])
+                for j in range(self.num_levels):
+                    setattr(self, f"{f}_{j}", getattr(self, f"{f}_{j}") + results[i, j])
+            else:
+                setattr(self, f, getattr(self, f) + results[i])
+
+        total_time = torch.tensor(time.time() - start_time)
+        self.time += total_time
+        self.count += target.size(0)
 
 
 _metric_dict = dict()
@@ -39,410 +206,22 @@ def register_metric(func: Callable):
         with torch.no_grad():
             value = func(*args, **kwargs)
         total_time = time.time() - start_time
-        return MetricDict(value, total_time, start_time)
+        return value, total_time
 
     _metric_dict[func.__name__] = wrapper
 
     return wrapper
 
 
-# -------------------------------------------------------------------------- #
-
-
-@dataclass
-class MetricsOptions:
-    """Texture synthesis metrics options"""
-
-    # Random seed for reproductibility.
-    seed: int = 0
-    # Overwrites the existing metrics.yaml file.
-    overwrite: bool = True
-    # Metrics to compute. Full list available in :metrics.py:.
-    metrics: list = field(default_factory=list)
-    # Transformation to perform on images befor computing metrics.
-    # Follows the same typing as the :transforms: parameter in
-    # :synthesis.py:
-    # Use raw: none to perform no transformation.
-    transforms: dict = field(default_factory=dict)
-    # Style distance batch size.
-    bstyle: int = 1
-    # Number of slice for SWD on CNN features.
-    sstyle: int = 1
-    # Neural statistics to use : 'mean', 'gram', 'covariance', 'swd'.
-    fstyle: list = field(default_factory=lambda: ["mean", "gram", "covariance", "swd"])
-    # Projection to use for the :style_distance_projected: metric.
-    projections: dict = field(default_factory=dict)
-    # Number of slices for SWD.
-    nhist: int = 1000
-    # SWD batch size.
-    bhist: int = 250
-    # Number of slices for SWD on gradients images.
-    ngrad: int = 1000
-    # Gradients SWD batch size.
-    bgrad: int = 250
-
-    # Model Options to use as a CNN for deep features extraction and style
-    # distances computation
-    cnn: CNNOptions = field(default_factory=CNNOptions)
-
-
-@dataclass
-class MetricDict:
-    """Dataclass to add metadata (computation time, execution date)
-    and statistics (mean, std, number of values) to metrics values"""
-
-    value: list | tuple | dict
-    total_time: float
-    timestamp: float
-    total_time_str: Optional[str] = None
-    date: Optional[str] = None
-    mean: Optional[float] = None
-    stdev: Optional[float] = None
-    nvalues: Optional[int] = None
-
-    def update_metadata(self):
-        self.total_time_str = format_time(self.total_time)
-        dtime = datetime.fromtimestamp(self.timestamp)
-        self.date = dtime.strftime("%Y-%m-%d %H:%M:%S")
-
-        self.mean = self.value_operation(self.value, statistics.fmean)
-        self.stdev = self.value_operation(self.value, stdev)
-        self.nvalues = len(self)
-
-    def __post_init__(self):
-        self.update_metadata()
-
-    def __add__(self, other):
-        if isinstance(other, MetricDict):
-            new_value = self.value_sum(self.value, other.value)
-            new_total_time = self.total_time + other.total_time
-            new_timestamp = max(self.timestamp, other.timestamp)
-            return MetricDict(new_value, new_total_time, new_timestamp)
-        else:
-            raise TypeError(
-                f"Can only sum {type(self)} with {type(self)}. \
-                    Got {type(other)}"
-            )
-
-    def __iadd__(self, other):
-        if isinstance(other, MetricDict):
-            self.value = self.value_sum(self.value, other.value)
-            self.total_time += other.total_time
-            self.new_timestamp = max(self.timestamp, other.timestamp)
-            self.update_metadata()
-            return self
-        else:
-            raise NotImplementedError
-
-    def __len__(self):
-        return self.value_len(self.value)
-
-    @classmethod
-    def value_sum(cls, a: dict | list | tuple, b: dict | list | tuple):
-        # lists/tuples → concaténation
-        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-            return type(a)(list(a) + list(b))
-
-        # dictionnaries
-        if isinstance(a, dict) and isinstance(b, dict):
-            result = dict(a)
-            for k, v in b.items():
-                if k in result:
-                    result[k] = cls.value_sum(result[k], v)
-                else:
-                    result[k] = v
-            return result
-
-        raise TypeError(f"Incompatible types : {type(a)} and {type(b)}")
-
-    @classmethod
-    def value_operation(cls, value: list | tuple | dict, operation: Callable):
-        # list/tuple
-        if isinstance(value, (list, tuple)):
-            return operation(value)
-
-        # dictionnary
-        if isinstance(value, dict):
-            result = {}
-            for k, v in value.items():
-                result[k] = cls.value_operation(v, operation)
-
-            return result
-
-        raise TypeError(f"Unsupported type : {type(value)}")
-
-    @classmethod
-    def value_len(cls, value: list | tuple | dict):
-        # list/tuple
-        if isinstance(value, (list, tuple)):
-            return len(value)
-
-        # dictionnary
-        if isinstance(value, dict):
-            return cls.value_len(list(value.values())[0])
-
-
-class MetricsCollection(dict):
-    """Custom dictionnary to enable acces with the attribute syntax
-    and easy logging.
-    attributes of instances are supposed to be :MetricDict:
-    instances."""
-
-    def __getattr__(self, name: str) -> Any:
-        try:
-            return self[name]
-        except KeyError:
-            raise AttributeError(name)
-
-    def add_metric(self, name: str, metric_dict: MetricDict) -> None:
-        if hasattr(self, name):
-            self[name] += metric_dict
-        else:
-            self[name] = metric_dict
-
-    def serialize(self, suffixe: Optional[str] = None, full: bool = True):
-        result = dict()
-        for k, v in self.items():
-            if is_dataclass(v):
-                m = asdict(v)
-            else:
-                m = v
-
-            if not full and "value" in m.keys():
-                m.pop("value")
-
-            result[add_suffixe(k, suffixe)] = m
-
-        return result
-
-    def dump(
-        self,
-        path: Path,
-        suffixe: Optional[str] = None,
-        overwrite: bool = False,
-        full=True,
-    ):
-        """Dumps a metrics.yaml file containing all metrics in
-        specified directory.
-
-        Args:
-            path (Path): logging dir.
-            suffixe (Optional[str], optional): suffixe to add to the
-                metrics.
-                Defaults to None.
-            overwrite (bool, optional): If True, overwrite the
-                :metrics.yaml: file if it exists. Else, only
-                overwrite the conflicted keys.
-                Defaults to False.
-        """
-        if overwrite:
-            metrics = self.serialize(full=full)
-        else:
-            try:
-                with open(path, "r") as yml:
-                    old_metrics = yaml.safe_load(yml)
-            except FileNotFoundError:
-                old_metrics = {}
-
-            metrics = merge_dict(old_metrics, self.serialize(suffixe, full=full))
-
-        print(f"Writing metric file in : {path}")
-        print("Overwrite = ", overwrite)
-
-        with open(path, "w") as yml:
-            yaml.dump(metrics, yml)
-
-    def __add__(self, other):
-        new_metric_coll = MetricsCollection()
-        for k, v in other.items():
-            new_metric_coll.add_metric(k, self[k])
-            new_metric_coll.add_metric(k, v)
-        return new_metric_coll
-
-    def __iadd__(self, other):
-        for k, v in other.items():
-            self.add_metric(k, v)
-        return self
-
-    def __len__(self):
-        metric_list = list(self.values())
-        if len(metric_list) == 0:
-            return 0
-        else:
-            print(metric_list[0])
-            return len(metric_list[0])
-
-
-# -------------------------------------------------------------------------- #
-
-
-@torch.no_grad()
-def calc_metrics(
-    options: MetricsOptions,
-    target: torch.Tensor,
-    synth: torch.Tensor,
-    cnn: Optional[CNN] = None,
-) -> MetricsCollection:
-    """Computes metrics.
-
-    Args:
-        options (MetricsOptions): metrics options.
-        target (torch.Tensor): target image.
-        synth (torch.Tensor): synthetic image.
-        init (Optional[torch.Tensor], optional): initialized
-            synthetic image (niter=0).
-            Defaults to None.
-        cnn (Optional[CNN], optional): CNN for neural statistics
-            extraction.
-            Defaults to None.
-
-    Returns:
-        MetricsCollection: Metrics.
-    """
-    set_seed(options.seed)
-    metrics_coll = MetricsCollection()
-    projections = {k: get_transform(target, v) for k, v in options.projections.items()}
-
-    for metric in options.metrics:
-        if metric == "style_distance":
-            if target.size(-3) == 3:
-                value = style_distance(target, synth, cnn, options)
-                metrics_coll.add_metric(metric, value)
-        elif metric == "style_distance_stochastic":
-            if target.size(-3) > 3:
-                value = style_distance_stochastic(target, synth, cnn, options)
-                metrics_coll.add_metric(metric, value)
-        elif metric == "style_distance_projected":
-            if target.size(-3) > 3:
-                for name, proj in projections.items():
-                    value = style_distance(proj(target), proj(synth), cnn, options)
-                    metrics_coll.add_metric(f"style_distance_{name}", value)
-        else:
-            value = _metric_dict[metric](target, synth, options)
-            metrics_coll.add_metric(metric, value)
-
-    return metrics_coll
-
-
-# -------------------------------------------------------------------------- #
-
-
-def common_pixels(init: torch.Tensor, synth: torch.Tensor):
-    """Computes common pixels between initial and final synthetic image.
-    Used to detect failed synthesis.
-
-    Args:
-        synth (torch.Tensor): synthetic image.
-        init (Optional[torch.Tensor], optional): initialized
-            synthetic image (niter=0).
-
-    Returns:
-        Number: number of pixels in common.
-    """
-    return [torch.isclose(init, synth).sum().tolist()]
-
-
-# ---------------------------------- Style --------------------------------- #
-
-
-@register_metric
-def style_distance(
-    target: torch.Tensor, synth: torch.Tensor, cnn: CNN, options: MetricsOptions
-) -> dict:
-    """Computes 3-channel style distance between target and synthetic
-    natural or projected images with CNN.
-    Computes style distances using different neural statistics
-    (e.g. 'mean', 'gramm', 'covariance', 'swd') given by attribute
-    :options.fstyle:.
-
-    Args:
-        target (torch.Tensor): target image.
-        synth (torch.Tensor): synthetic image.
-        cnn (CNN): CNN for neural statistics extraction.
-        options (MetricsOptions): metrics options.
-
-    Returns:
-        dict: dictionnary containing the style distances.
-    """
-    target_outputs = cnn(target)
-    synth_outputs = cnn(synth)
-
-    results = dict()
-    for metric in options.fstyle:
-        res = style_distances.weighted_feature_distance(
-            synth_outputs,
-            target_outputs,
-            metric,
-            weights=cnn.options.layers_weights,
-            contributions=True,
-            sstyle=options.sstyle,
-        )
-        if res.ndim == 1:
-            res.unsqueeze_(0)
-
-        names = [f"{metric}_{i}" for i in range(len(synth_outputs))] + [
-            f"{metric}_total"
-        ]
-        results = {**results, **dict(zip(names, res.T.tolist()))}
-
-    return results
-
-
-@register_metric
-def style_distance_stochastic(
-    target: torch.Tensor, synth: torch.Tensor, cnn: CNN, options: MetricsOptions
-) -> dict:
-    """Computes stochastic style distance between target and
-    synthetic multispectral images with CNN.
-    Computes style distances using different neural statistics
-    (e.g. 'mean', 'gramm', 'covariance', 'swd') given by attribute
-    :options.fstyle:.
-
-    Args:
-        target (torch.Tensor): target image.
-        synth (torch.Tensor): synthetic image.
-        cnn (CNN): CNN for neural statistics extraction.
-        options (MetricsOptions): metrics options.
-
-    Returns:
-        dict: dictionnary containing the style distances.
-    """
-    # Init random triplet sampler
-    random_triplets = RandomTripletDataset(target.shape[-3])
-    loader = DataLoader(random_triplets, batch_size=options.bstyle)
-
-    results = torch.zeros(
-        len(options.fstyle), len(cnn.options.layers_weights) + 1, device=target.device
-    )
-    for channels in loader:
-        target_outputs = cnn(target[..., channels, :, :].squeeze(0))
-        synth_outputs = cnn(synth[..., channels, :, :].squeeze(0))
-        for i, metric in enumerate(options.fstyle):
-            results[i].add_(
-                channels.size(0)
-                * style_distances.weighted_feature_distance(
-                    synth_outputs,
-                    target_outputs,
-                    metric,
-                    weights=cnn.options.layers_weights,
-                    contributions=True,
-                    sstyle=options.sstyle,
-                )
-            )
-
-    names = []
-    for metric in options.fstyle:
-        names += [f"metric_{i}" for i in range(len(synth_outputs))]
-        names += ["metric_total"]
-
-    results.div_(len(random_triplets))
-    return dict(zip(names, results.flatten().T.tolist()))
-
-
 # ------------------------------- Distrbutions ----------------------------- #
 
 
-def distribution_distances(target: torch.Tensor, synth: torch.Tensor, nslice: int):
+def distribution_distances(
+    target: torch.Tensor,
+    synth: torch.Tensor,
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
+):
     """Computes distribution distances (band-wise Wasserstein
     distance and SWD) between target and synthetic images.
 
@@ -454,22 +233,21 @@ def distribution_distances(target: torch.Tensor, synth: torch.Tensor, nslice: in
     Returns:
         dict: dictionnary containing the distribution distances.
     """
+    hist_dist = optimal_transport.histogram_loss1D(target, synth).sqrt().sum(dim=0)
     return {
         "swd": optimal_transport.sliced_wasserstein_distance(
-            target, synth, nslice=nslice
-        ).tolist(),
-        **dict(
-            zip(
-                [f"band_{i}" for i in range(target.size(-3))],
-                optimal_transport.histogram_loss1D(target, synth).sqrt().T.tolist(),
-            )
-        ),
+            target, synth, nslice=nslice, batch_size=batch_size
+        ).sum(dim=0),
+        **dict([(f"band_{i}", hist_dist[i]) for i in range(target.size(-3))]),
     }
 
 
 @register_metric
 def sliced_wasserstein_distance(
-    target: torch.Tensor, synth: torch.Tensor, options: MetricsOptions
+    target: torch.Tensor,
+    synth: torch.Tensor,
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
 ):
     """Computes Sliced Wasserstein Distance (SWD) between target and
     synthetic images.
@@ -483,12 +261,17 @@ def sliced_wasserstein_distance(
         Number: SWD
     """
     return optimal_transport.sliced_wasserstein_distance(
-        target, synth, nslice=options.nhist, batch_size=options.bhist
-    ).tolist()
+        target, synth, nslice=nslice, batch_size=batch_size
+    ).sum(dim=0)
 
 
 @register_metric
-def histograms(target: torch.Tensor, synth: torch.Tensor, options: MetricsOptions):
+def histograms(
+    target: torch.Tensor,
+    synth: torch.Tensor,
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
+):
     """Computes histogram distances.
 
     Args:
@@ -499,13 +282,35 @@ def histograms(target: torch.Tensor, synth: torch.Tensor, options: MetricsOption
     Returns:
         dict: dictionnary containing histogram distances.
     """
-    return distribution_distances(target, synth, nslice=options.bhist)
+    return distribution_distances(target, synth, nslice=nslice, batch_size=batch_size)
+
+
+def get_stats(tnsr: torch.Tensor, cholesky=False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute first and second order statistics of an image.
+
+    Args:
+        tnsr (torch.Tensor): input image
+        cholesky (bool, optional): Computes and return Cholesky
+            decomposition of the covariance matrix.
+            Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: mean and
+            covariance/Cholesky decomposition
+    """
+    tnsr = tnsr.flatten(start_dim=-2)
+    mu = tnsr.mean(dim=-1, keepdim=True)
+    tnsr = tnsr - mu
+    cov = tnsr @ tnsr.transpose(-1, -2) / tnsr.shape[-1]
+    if cholesky:
+        l = torch.linalg.cholesky(cov)
+        return mu.squeeze(-1), l
+    else:
+        return mu.squeeze(-1), cov
 
 
 @register_metric
-def color_statistics(
-    target: torch.Tensor, synth: torch.Tensor, options: MetricsOptions
-):
+def color_statistics(target: torch.Tensor, synth: torch.Tensor):
     """Computes color statistics distances (mean, cov, RX).
 
     Args:
@@ -523,9 +328,9 @@ def color_statistics(
         + optimal_transport.bure_distance(covt, covs)
     )
     return {
-        "mean": torch.mean((mut - mus) ** 2, dim=-1).tolist(),
-        "covariance": torch.mean((covt - covs) ** 2, dim=(-1, -2)).tolist(),
-        "RX": bure_distance.tolist(),
+        "mean": torch.mean((mut - mus) ** 2, dim=-1).sum(dim=0),
+        "covariance": torch.mean((covt - covs) ** 2, dim=(-1, -2)).sum(dim=0),
+        "RX": bure_distance.sum(dim=0),
     }
 
 
@@ -533,9 +338,7 @@ def color_statistics(
 
 
 @register_metric
-def spectral_radial_distance(
-    target: torch.Tensor, synth: torch.Tensor, options: MetricsOptions
-):
+def spectral_radial_distance(target: torch.Tensor, synth: torch.Tensor):
     """Computes L-2 distance on azimuthal spectra (mean and band-wise).
 
     Args:
@@ -550,17 +353,20 @@ def spectral_radial_distance(
     names = [f"band_{i}" for i in range(target.size(-3))]
     dist_mean = fourier.spectral_radial_distance(
         target.mean(dim=-3), synth.mean(dim=-3)
-    ).sqrt()
-    dist_band = fourier.spectral_radial_distance(target, synth).sqrt()
-    return {"mean": dist_mean.tolist(), **dict(zip(names, dist_band.T.tolist()))}
+    ).sqrt().sum(dim=0)
+    dist_band = fourier.spectral_radial_distance(target, synth).sqrt().sum(dim=0)
+    return {"mean": dist_mean, **dict(zip(names, dist_band))}
 
 
 # -------------------------------- Gradients ------------------------------- #
 
 
 @register_metric
-def gradients_distance(
-    target: torch.Tensor, synth: torch.Tensor, options: MetricsOptions
+def gradients_magnitude_distance(
+    target: torch.Tensor,
+    synth: torch.Tensor,
+    nslice: Optional[int] = 1,
+    batch_size: Optional[int] = None,
 ):
     """Computes gradients distribution distances (along x and y axis
     and magnitude).
@@ -573,10 +379,171 @@ def gradients_distance(
     Returns:
         dict: dictionnary containing gradients distances.
     """
-    dt_x, dt_y, dt = gradients.image_gradient(target)
-    ds_x, ds_y, ds = gradients.image_gradient(synth)
-    return {
-        "dx": distribution_distances(dt_x, ds_x, nslice=options.bgrad),
-        "dy": distribution_distances(dt_y, ds_y, nslice=options.bgrad),
-        "dmag": distribution_distances(dt, ds, nslice=options.bgrad),
-    }
+    dt = gradients.image_gradient(target, result='mag')
+    ds = gradients.image_gradient(synth, result='mag')
+    return distribution_distances(dt, ds, nslice=nslice, batch_size=batch_size)
+
+
+class SimpleDistance(Metric):
+    def __init__(self, dist_fn: Callable | str, name: Optional[str], kwargs: dict = {}):
+        super().__init__()
+
+        if isinstance(dist_fn, str):
+            self.dist_fn = _metric_dict[dist_fn]
+
+        if name is None:
+            name = dist_fn.__name__
+        self.name = name
+
+        self.kwargs = kwargs
+
+        self.add_state("distance", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0.), dist_reduce_fx="sum")
+
+    def update(self, target: torch.Tensor, synth: torch.Tensor):
+        value, time = self.dist_fn(target, synth, **self.kwargs)
+        self.distance += value
+        self.count += target.size(0)
+        self.time += time
+
+    def compute(self) -> torch.Tensor:
+        """Compute the final metric value.
+
+        Returns:
+            torch.Tensor: the average distance over all samples.
+        """
+        return self.distance / self.count
+
+class DictDistance(Metric):
+    def __init__(self, dist_fn: Callable | str, name: Optional[str], nbands: int = 3, kwargs: dict = {}):
+        super().__init__()
+
+        if isinstance(dist_fn, str):
+            self.dist_fn = _metric_dict[dist_fn]
+
+        if name is None:
+            name = self.dist_fn.__name__
+        self.name = name
+
+        self.kwargs = kwargs
+
+        dummy_target = torch.randn(1, nbands, 64, 64)
+        dummy_synth = torch.randn(1, nbands, 64, 64)
+        dummy_output, _ = self.dist_fn(dummy_target, dummy_synth)
+        self.keys = dummy_output.keys()
+        for k in self.keys:
+            self.add_state(k, default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0.), dist_reduce_fx="sum")
+
+    def update(self, target: torch.Tensor, synth: torch.Tensor):
+        values, time = self.dist_fn(target, synth, **self.kwargs)
+        for k,v in values.items():
+            setattr(self, k, getattr(self, k) + v)
+        self.count += target.size(0)
+        self.time += time
+
+    def compute(self) -> torch.Tensor:
+        """Compute the final metric value.
+
+        Returns:
+            torch.Tensor: the average distance over all samples.
+        """
+        results = {}
+        for k in self.keys:
+            results[k] = getattr(self, k) / self.count
+        return results
+
+
+def compute_metrics(metrics: List[Metric], reset: bool = True) -> dict:
+    results = {}
+    for metric in metrics:
+        metric_value = metric.compute()
+        if isinstance(metric_value, torch.Tensor):
+            metric_value = metric_value.item()
+        elif isinstance(metric_value, dict):
+            metric_value = {k: v.item() for k, v in metric_value.items()}
+        results[metric.name] = {"value": metric_value, "time": metric.time.item()}
+        if reset:
+            metric.reset()
+    return results
+
+
+def metrics_loop(
+    model: torch.nn.Module,
+    metrics: List[Metric],
+    loader: torch.utils.data.DataLoader,
+    nimg: Optional[int] = None,
+    seed: Optional[int] = None,
+    enable_progress_bar: bool = True,
+    **kwargs,
+):
+    _rng_states = collect_rng_states()
+    seed_everything(seed)
+    model.eval()
+    start_time = datetime.now()
+    img_count = 0
+
+    with progress_bar(
+        enable_progress_bar=enable_progress_bar, global_rank=0
+    ) as progress:
+        if progress is not None:
+            task_id = progress.add_task(
+                "Metrics/Generation",
+                total=len(loader) if hasattr(loader, "__len__") else None,
+            )
+
+            while img_count < nimg if nimg is not None else True:
+                for batch in loader:
+                    if nimg is not None and img_count >= nimg:
+                        break
+
+                    output = model(batch, **kwargs)
+
+                    for metric in metrics:
+                        metric.update(output["sample"], output["target"])
+
+                    if progress is not None and task_id is not None:
+                        progress.update(task_id, advance=1)
+
+                    img_count += output["target"].size(0)
+
+                if nimg is None:
+                    break  # Exit the loop if nimg is not specified
+
+        print(f"[info] Total images processed for metrics: {img_count}")
+        print(f"[info] Computing final metrics...")
+        results = compute_metrics(metrics, reset=True)
+
+    set_rng_states(_rng_states)
+    torch.cuda.empty_cache()
+
+    endtime = datetime.now()
+    results["starttime"] = str(start_time.strftime("%Y-%m-%d %H:%M:%S"))
+    results["endtime"] = str(endtime.strftime("%Y-%m-%d %H:%M:%S"))
+    results["duration"] = str(endtime - start_time)
+    results["number_images"] = img_count
+
+    return results
+
+
+def save_metrics(results: dict, save_dir: str, output_name: str):
+    """
+    Save the metrics results to a YAML file in the specified directory.
+    """
+    # ── Save JSON ────────────────────────────────────────────────────────────
+    json_path = save_dir / f"{output_name}_metrics.json"
+    with open(json_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[info] JSON saved → {json_path}")
+
+    # ── Save CSV ─────────────────────────────────────────────────────────────
+    csv_path = save_dir / f"{output_name}_metrics.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["metric", "value"])
+        writer.writeheader()
+        for metric_key, value in sorted(results.items()):
+            writer.writerow({"metric": metric_key, "value": value})
+
+    print(f"[info] CSV  saved → {csv_path}")
