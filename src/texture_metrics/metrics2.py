@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from .criteria import weighted_feature_distance
 from .criteria import gradients, fourier, optimal_transport
 from .criteria.cnn import CNN, RandomTripletDataset
+from .transforms import get_transform
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = False
@@ -39,7 +40,9 @@ class StyleDistance(Metric):
         cnn: Optional[CNN | dict] = None,
         features: Iterable[str] = ["mean", "gram", "covariance"],
         contributions: bool = True,
-        transform: Optional[str | Callable] = None,
+        transform: Optional[Callable] = None,
+        transform_name: Optional[str] = None,
+        transform_path: Optional[str | Path] = None,
         name: str = "style_distance",
         compile: bool = True,
         **kwargs,
@@ -48,7 +51,10 @@ class StyleDistance(Metric):
         self.name = name
         self.features = features
         self.contributions = contributions
-        self.transform = transform
+        if transform is not None:
+            self.transform = transform
+        else:
+            self.transform = get_transform(transform_name, transform_path)
         self.kwargs = kwargs
 
         if isinstance(cnn, dict):
@@ -58,7 +64,7 @@ class StyleDistance(Metric):
         if compile:
             self.cnn.compile()
 
-        dummy_tensor = torch.randn(1, 3, 128, 128)
+        dummy_tensor = torch.randn(1, 3, 256, 256)
         dummy_output = cnn(dummy_tensor)
         self.num_levels = len(dummy_output)
         for f in self.features:
@@ -69,7 +75,7 @@ class StyleDistance(Metric):
                         f"{f}_{i}", default=torch.tensor(0.0), dist_reduce_fx="sum"
                     )
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("time", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0, dtype=torch.float32), dist_reduce_fx="sum")
 
     def update(
         self,
@@ -80,8 +86,8 @@ class StyleDistance(Metric):
         start_time = time.time()
         cnn = cnn or self.cnn
 
-        target_outputs = cnn(target)
-        synth_outputs = cnn(synth)
+        target_outputs = cnn(self.transform(target))
+        synth_outputs = cnn(self.transform(synth))
 
         for f in self.features:
             res = weighted_feature_distance(
@@ -119,15 +125,17 @@ class StochasticStyleDistance(StyleDistance):
         self,
         cnn=None,
         features=["mean", "gram", "covariance"],
-        contributions=True,
-        transform=None,
-        name="style_distance",
+        contributions: bool = True,
+        transform: Optional[Callable] = None,
+        transform_name: Optional[str] = None,
+        transform_path: Optional[str | Path] = None,
+        name="stochastic_style_distance",
         compile=True,
         batch_size: int = 1,
         **kwargs,
     ):
         super().__init__(
-            cnn, features, contributions, transform, name, compile, **kwargs
+            cnn, features, contributions, transform, transform_name, transform_path, name, compile, **kwargs
         )
         self.batch_size = batch_size
 
@@ -139,8 +147,9 @@ class StochasticStyleDistance(StyleDistance):
     ):
         start_time = time.time()
         cnn = cnn or self.cnn
+        b, c, h, w = target.shape
         triplet_generator = DataLoader(
-            RandomTripletDataset(target.shape[-3]), batch_size=self.batch_size
+            RandomTripletDataset(c), batch_size=self.batch_size
         )
 
         results = torch.zeros(
@@ -149,31 +158,30 @@ class StochasticStyleDistance(StyleDistance):
             device=target.device,
         )
         for channels in triplet_generator:
-            target_outputs = cnn(target[..., channels, :, :].squeeze(0))
-            synth_outputs = cnn(synth[..., channels, :, :].squeeze(0))
+            target_outputs = cnn(target[..., channels, :, :].reshape(-1, 3, h, w))
+            synth_outputs = cnn(synth[..., channels, :, :].reshape(-1, 3, h, w))
             for i, f in enumerate(self.features):
                 results[i].add_(
-                    channels.size(0)
-                    * weighted_feature_distance(
+                    weighted_feature_distance(
                         synth_outputs,
                         target_outputs,
                         f,
                         weights=cnn.layers_weights,
                         contributions=self.contributions,
                         **self.kwargs,
-                    )
+                    ).sum(dim=0)
                 )
 
-        results = results.sum(dim=0) / len(triplet_generator)
-        for f in self.features:
+        results = results / len(triplet_generator)
+        for i, f in enumerate(self.features):
             if self.contributions:
-                setattr(self, f, getattr(self, f) + results[-1])
-                for i in range(self.num_levels):
-                    setattr(self, f"{f}_{i}", getattr(self, f"{f}_{i}") + results[i])
+                setattr(self, f, getattr(self, f) + results[i, -1])
+                for j in range(self.num_levels):
+                    setattr(self, f"{f}_{j}", getattr(self, f"{f}_{j}") + results[i, j])
             else:
-                setattr(self, f, getattr(self, f) + results)
+                setattr(self, f, getattr(self, f) + results[i])
 
-        total_time = time.time() - start_time
+        total_time = torch.tensor(time.time() - start_time)
         self.time += total_time
         self.count += target.size(0)
 
@@ -225,17 +233,12 @@ def distribution_distances(
     Returns:
         dict: dictionnary containing the distribution distances.
     """
-    print(f"nslice = {nslice}, batch_size = {batch_size}")
+    hist_dist = optimal_transport.histogram_loss1D(target, synth).sqrt().sum(dim=0)
     return {
         "swd": optimal_transport.sliced_wasserstein_distance(
             target, synth, nslice=nslice, batch_size=batch_size
-        ).tolist(),
-        **dict(
-            zip(
-                [f"band_{i}" for i in range(target.size(-3))],
-                optimal_transport.histogram_loss1D(target, synth).sqrt().T.tolist(),
-            )
-        ),
+        ).sum(dim=0),
+        **dict([(f"band_{i}", hist_dist[i]) for i in range(target.size(-3))]),
     }
 
 
@@ -259,7 +262,7 @@ def sliced_wasserstein_distance(
     """
     return optimal_transport.sliced_wasserstein_distance(
         target, synth, nslice=nslice, batch_size=batch_size
-    ).tolist()
+    ).sum(dim=0)
 
 
 @register_metric
@@ -325,9 +328,9 @@ def color_statistics(target: torch.Tensor, synth: torch.Tensor):
         + optimal_transport.bure_distance(covt, covs)
     )
     return {
-        "mean": torch.mean((mut - mus) ** 2, dim=-1).tolist(),
-        "covariance": torch.mean((covt - covs) ** 2, dim=(-1, -2)).tolist(),
-        "RX": bure_distance.tolist(),
+        "mean": torch.mean((mut - mus) ** 2, dim=-1).sum(dim=0),
+        "covariance": torch.mean((covt - covs) ** 2, dim=(-1, -2)).sum(dim=0),
+        "RX": bure_distance.sum(dim=0),
     }
 
 
@@ -350,9 +353,9 @@ def spectral_radial_distance(target: torch.Tensor, synth: torch.Tensor):
     names = [f"band_{i}" for i in range(target.size(-3))]
     dist_mean = fourier.spectral_radial_distance(
         target.mean(dim=-3), synth.mean(dim=-3)
-    ).sqrt()
-    dist_band = fourier.spectral_radial_distance(target, synth).sqrt()
-    return {"mean": dist_mean.tolist(), **dict(zip(names, dist_band.T.tolist()))}
+    ).sqrt().sum(dim=0)
+    dist_band = fourier.spectral_radial_distance(target, synth).sqrt().sum(dim=0)
+    return {"mean": dist_mean, **dict(zip(names, dist_band))}
 
 
 # -------------------------------- Gradients ------------------------------- #
@@ -376,8 +379,8 @@ def gradients_magnitude_distance(
     Returns:
         dict: dictionnary containing gradients distances.
     """
-    _, _, dt = gradients.image_gradient(target)
-    _, _, ds = gradients.image_gradient(synth)
+    dt = gradients.image_gradient(target, result='mag')
+    ds = gradients.image_gradient(synth, result='mag')
     return distribution_distances(dt, ds, nslice=nslice, batch_size=batch_size)
 
 
@@ -396,11 +399,11 @@ class SimpleDistance(Metric):
 
         self.add_state("distance", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("time", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0.), dist_reduce_fx="sum")
 
     def update(self, target: torch.Tensor, synth: torch.Tensor):
         value, time = self.dist_fn(target, synth, **self.kwargs)
-        self.distance += target.size(0) * value
+        self.distance += value
         self.count += target.size(0)
         self.time += time
 
@@ -432,12 +435,12 @@ class DictDistance(Metric):
         for k in self.keys:
             self.add_state(k, default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("time", default=torch.tensor(0), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0.), dist_reduce_fx="sum")
 
     def update(self, target: torch.Tensor, synth: torch.Tensor):
         values, time = self.dist_fn(target, synth, **self.kwargs)
         for k,v in values.items():
-            setattr(self, k, getattr(self, k) + target.size(0) * v)
+            setattr(self, k, getattr(self, k) + v)
         self.count += target.size(0)
         self.time += time
 
@@ -461,7 +464,7 @@ def compute_metrics(metrics: List[Metric], reset: bool = True) -> dict:
             metric_value = metric_value.item()
         elif isinstance(metric_value, dict):
             metric_value = {k: v.item() for k, v in metric_value.items()}
-        results[metric.name] = metric_value
+        results[metric.name] = {"value": metric_value, "time": metric.time.item()}
         if reset:
             metric.reset()
     return results
@@ -479,7 +482,7 @@ def metrics_loop(
     _rng_states = collect_rng_states()
     seed_everything(seed)
     model.eval()
-    start_time = datetime.datetime.now()
+    start_time = datetime.now()
     img_count = 0
 
     with progress_bar(
@@ -516,10 +519,11 @@ def metrics_loop(
     set_rng_states(_rng_states)
     torch.cuda.empty_cache()
 
-    endtime = datetime.datetime.now()
+    endtime = datetime.now()
     results["starttime"] = str(start_time.strftime("%Y-%m-%d %H:%M:%S"))
     results["endtime"] = str(endtime.strftime("%Y-%m-%d %H:%M:%S"))
     results["duration"] = str(endtime - start_time)
+    results["number_images"] = img_count
 
     return results
 
