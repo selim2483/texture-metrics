@@ -1,4 +1,5 @@
 import math
+import time
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -45,6 +46,7 @@ class DistributionDistance(Metric):
 
         self.add_state("real", default=[], dist_reduce_fx="cat")
         self.add_state("fake", default=[], dist_reduce_fx="cat")
+        self.add_state("time", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
         self.max_real_samples = max_real_samples
 
@@ -76,6 +78,7 @@ class DistributionDistance(Metric):
             imgs (torch.Tensor): batch of images, shape (B, C, H, W).
             real (bool): whether the images are real or fake.
         """
+        start_time = time.time()
         reprs = self.repr_fn(imgs, **self.repr_fn_kwargs).reshape(
             imgs.shape[0], -1
         )
@@ -83,6 +86,7 @@ class DistributionDistance(Metric):
         num_samples = sum(t.shape[0] for t in target)
         if num_samples < self.max_real_samples:
             target.append(reprs)
+        self.time = self.time + (time.time() - start_time)
 
     def compute(self) -> torch.Tensor:
         """Compute the metric value.
@@ -90,9 +94,12 @@ class DistributionDistance(Metric):
         Returns:
             torch.Tensor: scalar metric value.
         """
+        start_time = time.time()
         reals = dim_zero_cat(self.real)
         target = dim_zero_cat(self.fake)
-        return self.dist_fn(reals, target, **self.dist_fn_kwargs)
+        result = self.dist_fn(reals, target, **self.dist_fn_kwargs)
+        self.time = self.time + (time.time() - start_time)
+        return result
 
 
 class CNNDistributionDistance(Metric):
@@ -144,6 +151,7 @@ class CNNDistributionDistance(Metric):
         for key in self.keys:
             self.add_state(f"real_{key}", default=[], dist_reduce_fx="cat")
             self.add_state(f"fake_{key}", default=[], dist_reduce_fx="cat")
+        self.add_state("time", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
         self.max_real_samples = max_real_samples
 
@@ -175,6 +183,7 @@ class CNNDistributionDistance(Metric):
             imgs (torch.Tensor): batch of images, shape (B, C, H, W).
             real (bool): whether the images are real or fake.
         """
+        start_time = time.time()
         reprs = cnn_activations(imgs, self.cnn, **self.repr_fn_kwargs)
         prefix = "real" if real else "fake"
         for key, value in reprs.items():
@@ -182,6 +191,7 @@ class CNNDistributionDistance(Metric):
             num_samples = sum(t.shape[0] for t in target)
             if num_samples < self.max_real_samples:
                 target.append(value.reshape(imgs.shape[0], -1))
+        self.time = self.time + (time.time() - start_time)
 
     def compute(self) -> dict[str, torch.Tensor]:
         """Compute the metric value.
@@ -189,11 +199,13 @@ class CNNDistributionDistance(Metric):
         Returns:
             dict[str, torch.Tensor]: dictionary of metric values for each representation.
         """
+        start_time = time.time()
         metrics = {}
         for key in self.keys:
             reals = dim_zero_cat(getattr(self, f"real_{key}"))
             target = dim_zero_cat(getattr(self, f"fake_{key}"))
             metrics[key] = self.dist_fn(reals, target, **self.dist_fn_kwargs)
+        self.time = self.time + (time.time() - start_time)
         return metrics
 
 
@@ -225,6 +237,7 @@ class FID(FrechetInceptionDistance):
         self.vmin, self.vmax = value_range
         self.max_real_samples = max_real_samples
         self.name = name
+        self.add_state("time", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
     def update(self, imgs: torch.Tensor, targets: torch.Tensor):
         """Update the metric state with a batch of images and their targets.
@@ -240,6 +253,19 @@ class FID(FrechetInceptionDistance):
         if real and self.real_features_num_samples >= self.max_real_samples:
             return
 
+        start_time = time.time()
         imgs = (imgs - self.vmin) / (self.vmax - self.vmin)
         imgs = torch.clamp(imgs, 0.0, 1.0)
         super().update(imgs, real)
+        self.time = self.time + (time.time() - start_time)
+
+    def compute(self) -> torch.Tensor:
+        """Compute the metric value.
+
+        Returns:
+            torch.Tensor: scalar FID value.
+        """
+        start_time = time.time()
+        result = super().compute()
+        self.time = self.time + (time.time() - start_time)
+        return result
