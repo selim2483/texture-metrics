@@ -19,6 +19,14 @@ register_representation(spectral_polynomial_embedding)
 
 
 @register_representation
+def flatten(x: torch.Tensor) -> torch.Tensor:
+    """Flattens all non-batch dimensions, turning a batch of images
+    into a batch of feature vectors. Generic fallback representation
+    for distance functions that expect (B, D) vectors."""
+    return x.flatten(start_dim=1)
+
+
+@register_representation
 def color_mean(x: torch.Tensor) -> torch.Tensor:
     return x.mean(dim=(-2, -1))
 

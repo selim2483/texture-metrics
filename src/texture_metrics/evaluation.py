@@ -1,9 +1,9 @@
 """Metric-agnostic evaluation loop and result utilities.
 
-Shared by both individual (per-sample) and distribution metrics: anything
+Shared by both sample (per-sample) and distribution metrics: anything
 implementing the ``torchmetrics.Metric`` interface (``update``/``compute``)
 can be passed to :func:`metrics_loop`, regardless of which registry
-(individual.py's ``_metric_dict`` or distributions.py's population-level
+(samples.py's ``_metric_dict`` or distributions.py's population-level
 metrics) it comes from.
 """
 

@@ -118,3 +118,44 @@ def per_bin_wasserstein_distance(
     fake = fake.T.unsqueeze(-1)
     dist = optimal_transport.histogram_loss1D(real, fake, p=p) ** (1 / p)
     return {f"bin_{i}": dist[i] for i in range(dist.shape[0])}
+
+
+@register_distance
+def mse(real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+    """Sum, over the batch, of the per-sample mean squared error
+    between two batches of feature vectors.
+
+    Unlike the population-level distances above (frechet_distance,
+    sliced_wasserstein_distance, ...), which compare two whole
+    distributions in one call, this compares paired samples and
+    returns a batch-summed value meant to be accumulated across
+    multiple calls and divided by the total count (see
+    :class:`texture_metrics.samples.SampleDistance`).
+
+    Args:
+        real (torch.Tensor): real features, shape (B, ...).
+        fake (torch.Tensor): synthetic features, shape (B, ...).
+
+    Returns:
+        torch.Tensor: scalar, summed over the batch.
+    """
+    return torch.mean(
+        (fake - real).flatten(start_dim=1) ** 2, dim=-1
+    ).sum(dim=0)
+
+
+@register_distance
+def l1(real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
+    """Sum, over the batch, of the per-sample mean absolute error
+    between two batches of feature vectors. See :func:`mse`.
+
+    Args:
+        real (torch.Tensor): real features, shape (B, ...).
+        fake (torch.Tensor): synthetic features, shape (B, ...).
+
+    Returns:
+        torch.Tensor: scalar, summed over the batch.
+    """
+    return torch.mean(
+        (fake - real).flatten(start_dim=1).abs(), dim=-1
+    ).sum(dim=0)

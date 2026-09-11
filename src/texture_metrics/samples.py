@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader
 from .criteria import weighted_feature_distance
 from .criteria import gradients, fourier, optimal_transport
 from .criteria.cnn import CNN, RandomTripletDataset
+from .distances import _dist_dict
+from .representations import _repr_dict, flatten
 from .transforms import get_transform
 
 
@@ -365,73 +367,184 @@ def gradients_magnitude_distance(
     return distribution_distances(dt, ds, nslice=nslice, batch_size=batch_size)
 
 
-class SimpleDistance(Metric):
-    def __init__(self, dist_fn: Callable | str, name: Optional[str], kwargs: dict = {}):
+# ------------------------ Representation + distance ----------------------- #
+
+
+class SampleDistance(Metric):
+    """Per-sample metric, built either from a registered full metric
+    function, or by composing a representation function with a
+    distance function.
+
+    Two mutually exclusive ways to build one:
+
+    - ``metric_fn``: a function (or its name, looked up in this
+      module's ``_metric_dict``) taking ``(target, synth, **kwargs)``
+      directly and returning a value (scalar tensor or dict of
+      tensors) -- e.g. ``"color_statistics"``, ``"histograms"``.
+    - ``dist_fn`` (+ optional ``repr_fn``): ``repr_fn`` first maps
+      ``target``/``synth`` to representations (defaults to spatial
+      flattening, turning images into feature vectors), then
+      ``dist_fn`` compares the two representations. ``dist_fn`` is
+      looked up (if given as a string) in
+      ``texture_metrics.distances._dist_dict`` -- so both simple
+      vector distances (``"mse"``, ``"l1"``) and population-level ones
+      (``"frechet_distance"``, ``"sliced_wasserstein_distance"``, ...)
+      can be used here, applied per-batch rather than over the whole
+      accumulated population. ``repr_fn`` is looked up in
+      ``texture_metrics.representations._repr_dict`` if given as a
+      string.
+
+    Whether the underlying function returns a scalar or a dict of
+    scalars is auto-detected from a dummy call at construction time,
+    so both cases (mirroring the old ``SimpleDistance``/
+    ``DictDistance`` split) are handled by the same class.
+
+    Args:
+        metric_fn (Optional[Callable | str]): full metric function, or
+            its registered name.
+        dist_fn (Optional[Callable | str]): distance function, or its
+            registered name. Required if ``metric_fn`` is not given.
+        repr_fn (Optional[Callable | str]): representation function,
+            or its registered name. Only used together with
+            ``dist_fn``; defaults to :func:`texture_metrics.representations.flatten`.
+        metric_fn_kwargs (dict): keyword arguments for ``metric_fn``.
+        repr_fn_kwargs (dict): keyword arguments for ``repr_fn``.
+        dist_fn_kwargs (dict): keyword arguments for ``dist_fn``.
+        name (Optional[str]): metric name. Defaults to
+            ``metric_fn.__name__`` or
+            ``f"{repr_fn.__name__}/{dist_fn.__name__}"``.
+        nchannels (int): number of channels for the dummy target/synth
+            images used to probe, at construction time, whether the
+            metric produces a scalar or a dict of scalars. Some
+            metrics' key sets depend on the channel count (e.g.
+            ``histograms``' per-band keys), so this must match the
+            number of channels the metric will actually be run on.
+    """
+
+    def __init__(
+        self,
+        metric_fn: Optional[Callable | str] = None,
+        dist_fn: Optional[Callable | str] = None,
+        repr_fn: Optional[Callable | str] = None,
+        metric_fn_kwargs: dict = {},
+        repr_fn_kwargs: dict = {},
+        dist_fn_kwargs: dict = {},
+        name: Optional[str] = None,
+        nchannels: int = 3,
+    ):
         super().__init__()
 
-        if isinstance(dist_fn, str):
-            self.dist_fn = _metric_dict[dist_fn]
+        self.metric_fn = None
+        self.repr_fn = None
+        self.dist_fn = None
 
-        if name is None:
-            name = dist_fn.__name__
+        if metric_fn is not None:
+            if isinstance(metric_fn, str):
+                metric_fn = _metric_dict[metric_fn]
+            self.metric_fn = metric_fn
+            self.metric_fn_kwargs = metric_fn_kwargs or {}
+            if name is None:
+                name = metric_fn.__name__
+        else:
+            assert dist_fn is not None, (
+                "SampleDistance requires either `metric_fn` or `dist_fn`."
+            )
+            if isinstance(dist_fn, str):
+                dist_fn = _dist_dict[dist_fn]
+            self.dist_fn = dist_fn
+            self.dist_fn_kwargs = dist_fn_kwargs or {}
+
+            if repr_fn is None:
+                repr_fn = flatten
+            elif isinstance(repr_fn, str):
+                repr_fn = _repr_dict[repr_fn]
+            self.repr_fn = repr_fn
+            self.repr_fn_kwargs = repr_fn_kwargs or {}
+
+            if name is None:
+                name = f"{repr_fn.__name__}/{dist_fn.__name__}"
         self.name = name
 
-        self.kwargs = kwargs
+        # Probe with dummy tensors: the underlying function may return
+        # a plain scalar (e.g. sliced_wasserstein_distance_image,
+        # frechet_distance) or a dict of scalars (e.g.
+        # color_statistics, per_bin_wasserstein_distance) -- states
+        # must be registered up front either way. `nchannels` matters
+        # here: some metrics' key sets depend on it (e.g. histograms'
+        # per-band keys track target.size(-3)), so the probe must use
+        # the same channel count the metric will really be run on.
+        #
+        # Sizing otherwise differs by path: metric_fn operates within
+        # a single image (spatial statistics), so a lone 64x64 dummy
+        # is cheap and matches real usage. The dist_fn path may reduce
+        # the representation to a population (e.g. frechet_distance's
+        # covariance + eigendecomposition, cost O(D^3) in the
+        # representation dimension D) -- with the default `flatten`
+        # repr_fn, a 64x64 probe image would blow that dimension up to
+        # nchannels*64*64 for nothing, and a single sample makes the
+        # covariance degenerate besides. Use a small batch of small
+        # images instead, cheap regardless of repr_fn/dist_fn.
+        if self.metric_fn is not None:
+            dummy_target = torch.randn(1, nchannels, 64, 64)
+            dummy_synth = torch.randn(1, nchannels, 64, 64)
+        else:
+            dummy_target = torch.randn(4, nchannels, 4, 4)
+            dummy_synth = torch.randn(4, nchannels, 4, 4)
+        dummy_value, _ = self._compute(dummy_target, dummy_synth)
+        self._is_dict = isinstance(dummy_value, dict)
+        if self._is_dict:
+            self.keys = list(dummy_value.keys())
+            for k in self.keys:
+                self.add_state(k, default=torch.tensor(0.0), dist_reduce_fx="sum")
+        else:
+            self.add_state("distance", default=torch.tensor(0.0), dist_reduce_fx="sum")
 
-        self.add_state("distance", default=torch.tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("time", default=torch.tensor(0.), dist_reduce_fx="sum")
+        self.add_state("time", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def _compute(
+        self, target: torch.Tensor, synth: torch.Tensor
+    ) -> Tuple[torch.Tensor | dict[str, torch.Tensor], float]:
+        """Runs the metric_fn or repr_fn+dist_fn path.
+
+        Returns:
+            Tuple[torch.Tensor | dict[str, torch.Tensor], float]:
+                the value (scalar or dict of scalars) and the elapsed
+                time.
+        """
+        if self.metric_fn is not None:
+            return self.metric_fn(target, synth, **self.metric_fn_kwargs)
+
+        start_time = time.time()
+        target_repr = self.repr_fn(target, **self.repr_fn_kwargs)
+        synth_repr = self.repr_fn(synth, **self.repr_fn_kwargs)
+        value = self.dist_fn(target_repr, synth_repr, **self.dist_fn_kwargs)
+        return value, time.time() - start_time
 
     def update(self, target: torch.Tensor, synth: torch.Tensor):
-        value, time = self.dist_fn(target, synth, **self.kwargs)
-        self.distance += value
-        self.count += target.size(0)
-        self.time += time
+        """Update the metric state with a batch of paired images.
 
-    def compute(self) -> torch.Tensor:
+        Args:
+            target (torch.Tensor): target images, shape (B, C, H, W).
+            synth (torch.Tensor): synthetic images, shape (B, C, H, W).
+        """
+        value, elapsed = self._compute(target, synth)
+        if self._is_dict:
+            for k, v in value.items():
+                setattr(self, k, getattr(self, k) + v)
+        else:
+            self.distance = self.distance + value
+        self.count += target.size(0)
+        self.time = self.time + elapsed
+
+    def compute(self) -> torch.Tensor | dict[str, torch.Tensor]:
         """Compute the final metric value.
 
         Returns:
-            torch.Tensor: the average distance over all samples.
+            torch.Tensor | dict[str, torch.Tensor]: the average
+                distance (or dict of average distances) over all
+                samples.
         """
+        if self._is_dict:
+            return {k: getattr(self, k) / self.count for k in self.keys}
         return self.distance / self.count
-
-class DictDistance(Metric):
-    def __init__(self, dist_fn: Callable | str, name: Optional[str], nbands: int = 3, kwargs: dict = {}):
-        super().__init__()
-
-        if isinstance(dist_fn, str):
-            self.dist_fn = _metric_dict[dist_fn]
-
-        if name is None:
-            name = self.dist_fn.__name__
-        self.name = name
-
-        self.kwargs = kwargs
-
-        dummy_target = torch.randn(1, nbands, 64, 64)
-        dummy_synth = torch.randn(1, nbands, 64, 64)
-        dummy_output, _ = self.dist_fn(dummy_target, dummy_synth)
-        self.keys = dummy_output.keys()
-        for k in self.keys:
-            self.add_state(k, default=torch.tensor(0.0), dist_reduce_fx="sum")
-        self.add_state("count", default=torch.tensor(0), dist_reduce_fx="sum")
-        self.add_state("time", default=torch.tensor(0.), dist_reduce_fx="sum")
-
-    def update(self, target: torch.Tensor, synth: torch.Tensor):
-        values, time = self.dist_fn(target, synth, **self.kwargs)
-        for k,v in values.items():
-            setattr(self, k, getattr(self, k) + v)
-        self.count += target.size(0)
-        self.time += time
-
-    def compute(self) -> torch.Tensor:
-        """Compute the final metric value.
-
-        Returns:
-            torch.Tensor: the average distance over all samples.
-        """
-        results = {}
-        for k in self.keys:
-            results[k] = getattr(self, k) / self.count
-        return results

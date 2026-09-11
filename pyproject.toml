@@ -15,6 +15,9 @@ version = "0.1.1"
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64"]
@@ -30,3 +33,4 @@ matplotlib = ">=3.10.7,<4"
 huggingface_hub = ">=1.28.0,<2"
 ruff = ">=0.16.4,<0.17"
 wandb = ">=0.28.2,<0.29"
+pytest = ">=8.0,<9"
