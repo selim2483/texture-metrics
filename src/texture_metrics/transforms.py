@@ -135,7 +135,7 @@ class BandSelector(torch.nn.Module):
 # -------------------------------------------------------------------------- #
 
 
-def get_transform(
+def get_transform_img(
     img: torch.Tensor, transform: Optional[str | Path | torch.Tensor | Iterable] = None
 ) -> v2.Transform | torch.nn.Module:
     """Gets transform given an image and an instruction.
@@ -177,14 +177,14 @@ def get_transform(
         elif transform == "pooling":
             return SpectralPool(3).to(img.device)
         else:
-            return get_transform(img, Path(transform))
+            return get_transform_img(img, Path(transform))
     elif isinstance(transform, Path):
         if transform.suffix in [".pt", ".pth"]:
             t = torch.load(transform, weights_only=True, map_location=img.device)
             if isinstance(t, (v2.Transform, torch.nn.Module)):
                 return t
             elif isinstance(t, torch.Tensor):
-                return get_transform(img, t)
+                return get_transform_img(img, t)
             elif isinstance(t, dict):
                 try:
                     return PCATransform(*[t[key] for key in ["V", "lambdas", "mu"]]).to(
@@ -193,16 +193,26 @@ def get_transform(
                 except KeyError:
                     pass
         else:
-            return get_transform(img, prep_img(transform, device=img.device))
+            return get_transform_img(img, prep_img(transform, device=img.device))
     elif is_iterable_of_ints(transform):
         return BandSelector(transform).to(img.device)
     elif isinstance(transform, Iterable):
         if len(transform) == 1:
-            return get_transform(img, transform[0])
+            return get_transform_img(img, transform[0])
         else:
-            transforms = get_transform(img, transform[:-1])
+            transforms = get_transform_img(img, transform[:-1])
             return v2.Compose(
-                [transforms, get_transform(transforms(img), transform[-1])]
+                [transforms, get_transform_img(transforms(img), transform[-1])]
             )
 
     return v2.Identity().to(img.device)
+
+
+def get_transform(name: Optional[str] = None, path: Optional[Path | str] = None):
+    if name == 'pca':
+        pca_dict = torch.load(path, weights_only=True, map_location=torch.device('cpu'))
+        transform = PCATransform(**pca_dict)
+    else:
+        transform = v2.Identity()
+    
+    return transform

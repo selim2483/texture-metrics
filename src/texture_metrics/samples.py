@@ -130,7 +130,9 @@ class StochasticStyleDistance(StyleDistance):
     ):
         start_time = time.time()
         cnn = cnn or self.cnn
+        print('a')
         b, c, h, w = target.shape
+        print('b')
         triplet_generator = DataLoader(
             RandomTripletDataset(c), batch_size=self.batch_size
         )
