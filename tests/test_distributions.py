@@ -4,6 +4,7 @@ from texture_metrics.distributions import (
     DistributionDistance,
     CNNDistributionDistance,
     FID,
+    MIND,
 )
 from texture_metrics.representations import RadialProfileExtractor
 
@@ -67,3 +68,37 @@ def test_max_real_samples_caps_both_real_and_fake(target_synth):
     metric.update(synth, target)
     assert sum(t.shape[0] for t in metric.real) == n
     assert sum(t.shape[0] for t in metric.fake) == n
+
+
+def _mind(target, **kwargs):
+    return MIND(
+        feature=RadialProfileExtractor(bin_size=2),
+        compile=False,
+        value_range=(-3.0, 3.0),
+        n_projections=16,
+        **kwargs,
+    )
+
+
+def test_mind_update_compute_with_lightweight_feature_extractor(target_synth):
+    target, synth = target_synth
+    metric = _mind(target)
+    metric.update(synth, target)
+    value = metric.compute()
+    assert torch.is_tensor(value) and value.ndim == 0
+    assert metric.time.item() >= 0.0
+
+
+def test_mind_near_zero_for_identical_populations(target_synth):
+    target, _ = target_synth
+    metric = _mind(target)
+    metric.update(target, target)
+    assert metric.compute().item() < 1e-6
+
+
+def test_mind_keeps_real_features_when_not_reset(target_synth):
+    target, synth = target_synth
+    metric = _mind(target, reset_real_features=False)
+    metric.update(synth, target)
+    metric.reset()
+    assert len(metric.real) == 1 and len(metric.fake) == 0

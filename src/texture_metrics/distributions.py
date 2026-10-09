@@ -4,13 +4,13 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 from torchmetrics import Metric
-from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.fid import FrechetInceptionDistance, NoTrainInceptionV3
 from torchmetrics.utilities import dim_zero_cat
 
 from .criteria.cnn import CNN
 
 from .representations import _repr_dict, cnn_activations
-from .distances import _dist_dict
+from .distances import _dist_dict, monge_inception_distance
 
 
 class DistributionDistance(Metric):
@@ -269,3 +269,148 @@ class FID(FrechetInceptionDistance):
         result = super().compute()
         self.time = self.time + (time.time() - start_time)
         return result
+
+
+class MIND(Metric):
+    """Monge Inception Distance.
+
+    Stores the features of real and fake images and compares them with
+    :func:`texture_metrics.distances.monge_inception_distance`. Unlike
+    FID, MIND is reliable with few samples, which makes it cheap enough
+    to track during training.
+
+    Args:
+        feature (int | torch.nn.Module): either an InceptionV3 feature
+            layer (64, 192, 768 or 2048) as for FID, or a custom feature
+            extractor mapping (B, C, H, W) images in [0, 1] to (B, D)
+            features.
+        reset_real_features (bool): whether ``reset`` also clears the
+            real features. Set to False to extract them only once.
+        feature_extractor_weights_path (str, optional): path to the
+            InceptionV3 weights.
+        antialias (bool): whether InceptionV3 uses antialiased resizing.
+        value_range (tuple[float, float]): range of the input images,
+            rescaled to [0, 1] before feature extraction.
+        max_real_samples (int | float): maximum number of stored samples,
+            applied to both real and fake features.
+        n_projections (int): number of random projections.
+        rng_seed (int): seed of the random projections.
+        name (str): metric name.
+        compile (bool): whether to compile the feature extractor.
+    """
+
+    is_differentiable = False
+    higher_is_better = False
+    full_state_update = False
+
+    def __init__(
+        self,
+        feature: Union[int, torch.nn.Module] = 2048,
+        reset_real_features: bool = True,
+        feature_extractor_weights_path: Optional[str] = None,
+        antialias: bool = True,
+        value_range: tuple[float, float] = (0.0, 1.0),
+        max_real_samples: int | float = math.inf,
+        n_projections: int = 100,
+        rng_seed: int = 0,
+        name: str = "mind",
+        compile: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+
+        if isinstance(feature, int):
+            valid_int_input = (64, 192, 768, 2048)
+            if feature not in valid_int_input:
+                raise ValueError(
+                    f"Integer input to argument `feature` must be one of "
+                    f"{valid_int_input}, but got {feature}."
+                )
+            self.feature_extractor = NoTrainInceptionV3(
+                name="inception-v3-compat",
+                features_list=[str(feature)],
+                feature_extractor_weights_path=feature_extractor_weights_path,
+                antialias=antialias,
+            )
+            self.used_custom_model = False
+        elif isinstance(feature, torch.nn.Module):
+            self.feature_extractor = feature
+            self.used_custom_model = True
+        else:
+            raise TypeError("Got unknown input to argument `feature`")
+        if compile:
+            self.feature_extractor.compile()
+
+        self.reset_real_features = reset_real_features
+        self.vmin, self.vmax = value_range
+        self.max_real_samples = max_real_samples
+        self.n_projections = n_projections
+        self.rng_seed = rng_seed
+        self.name = name
+
+        self.add_state("real", default=[], dist_reduce_fx="cat")
+        self.add_state("fake", default=[], dist_reduce_fx="cat")
+        self.add_state("time", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, imgs: torch.Tensor, targets: torch.Tensor):
+        """Update the metric state with a batch of images and their targets.
+
+        Args:
+            imgs (torch.Tensor): batch of images, shape (B, C, H, W).
+            targets (torch.Tensor): batch of target images, shape (B, C, H, W).
+        """
+        self._update(imgs, real=False)
+        self._update(targets, real=True)
+
+    def _update(self, imgs: torch.Tensor, real: bool):
+        """Update the metric state with a batch of images.
+
+        Args:
+            imgs (torch.Tensor): batch of images, shape (B, C, H, W).
+            real (bool): whether the images are real or fake.
+        """
+        target = self.real if real else self.fake
+        if sum(t.shape[0] for t in target) >= self.max_real_samples:
+            return
+
+        start_time = time.time()
+        imgs = (imgs - self.vmin) / (self.vmax - self.vmin)
+        imgs = torch.clamp(imgs, 0.0, 1.0)
+        if not self.used_custom_model:
+            imgs = (imgs * 255).byte()
+        features = self.feature_extractor(imgs).reshape(imgs.shape[0], -1)
+        target.append(features.double())
+        self.time = self.time + (time.time() - start_time)
+
+    def compute(self) -> torch.Tensor:
+        """Compute the metric value.
+
+        Real and fake features are truncated to their common number of
+        samples, as MIND requires equally sized sets.
+
+        Returns:
+            torch.Tensor: scalar MIND value.
+        """
+        start_time = time.time()
+        reals = dim_zero_cat(self.real)
+        fakes = dim_zero_cat(self.fake)
+        n = min(reals.shape[0], fakes.shape[0])
+        result = monge_inception_distance(
+            reals[:n],
+            fakes[:n],
+            rng_seed=self.rng_seed,
+            n_projections=self.n_projections,
+        ).float()
+        self.time = self.time + (time.time() - start_time)
+        return result
+
+    def reset(self) -> None:
+        """Reset the metric state, keeping real features if
+        ``reset_real_features`` is False."""
+        if self.reset_real_features:
+            super().reset()
+            return
+        # states missing from _defaults are left untouched by reset
+        default = self._defaults.pop("real")
+        super().reset()
+        self._defaults["real"] = default

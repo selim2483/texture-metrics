@@ -78,6 +78,43 @@ def sliced_wasserstein_distance(
 
 
 @register_distance
+def monge_inception_distance(
+    real: torch.Tensor, fake: torch.Tensor, rng_seed: int = 0, n_projections=100
+) -> torch.Tensor:
+    """Monge Inception distance (MIND) between two sets of feature vectors.
+
+    Squared sliced Wasserstein distance over ``n_projections`` random
+    directions, scaled by ``3 * D`` so that its magnitude does not
+    shrink with the feature dimension.
+
+    Args:
+        real (torch.Tensor): real features, shape (N, D).
+        fake (torch.Tensor): synthetic features, shape (M, D).
+        rng_seed (int): random seed for reproducibility.
+        n_projections (int): number of projections to use.
+
+    Returns:
+        torch.Tensor: scalar MIND.
+    """
+    n, d = real.shape
+    assert n == fake.shape[0] and d == fake.shape[1], (
+        f"real and fake must have the same shape, got {real.shape} and {fake.shape}"
+    )
+    alpha = 3 * d
+    generator = torch.Generator(device=real.device).manual_seed(rng_seed)
+    u_proj = torch.randn(
+        (n_projections, d), generator=generator, dtype=real.dtype, device=real.device)
+    u_proj = u_proj / u_proj.norm(dim=1, keepdim=True)
+
+    # (N, n_projections): sort each projection over the samples
+    x_proj = torch.sort(real @ u_proj.T, dim=0).values
+    y_proj = torch.sort(fake @ u_proj.T, dim=0).values
+    dists = torch.mean((x_proj - y_proj) ** 2, dim=0)
+
+    return alpha * torch.mean(dists)
+
+
+@register_distance
 def histogram_distance(real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
     """L1 distance between histograms of feature vectors.
 

@@ -8,6 +8,7 @@ from texture_metrics.distances import (
     per_bin_wasserstein_distance,
     mse,
     l1,
+    monge_inception_distance,
 )
 
 
@@ -91,3 +92,15 @@ def test_per_bin_wasserstein_distance_shape_and_zero_for_identical():
     assert set(result.keys()) == {f"bin_{i}" for i in range(5)}
     for v in result.values():
         assert abs(v.item()) < 1e-4
+
+
+def test_monge_inception_distance_identical_is_zero():
+    x = _gaussian_features()
+    assert monge_inception_distance(x, x).item() < 1e-6
+
+
+def test_monge_inception_distance_grows_with_shift():
+    x = _gaussian_features(seed=0)
+    y_near = _gaussian_features(mean=0.1, seed=1)
+    y_far = _gaussian_features(mean=2.0, seed=1)
+    assert monge_inception_distance(x, y_far) > monge_inception_distance(x, y_near)
