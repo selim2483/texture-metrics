@@ -104,3 +104,13 @@ def test_monge_inception_distance_grows_with_shift():
     y_near = _gaussian_features(mean=0.1, seed=1)
     y_far = _gaussian_features(mean=2.0, seed=1)
     assert monge_inception_distance(x, y_far) > monge_inception_distance(x, y_near)
+
+
+def test_monge_inception_distance_independent_of_projection_batch_size():
+    x = _gaussian_features(seed=0)
+    y = _gaussian_features(mean=0.5, seed=1)
+    full = monge_inception_distance(x, y, n_projections=100)
+    batched = monge_inception_distance(
+        x, y, n_projections=100, projection_batch_size=32
+    )
+    torch.testing.assert_close(batched, full)

@@ -79,7 +79,11 @@ def sliced_wasserstein_distance(
 
 @register_distance
 def monge_inception_distance(
-    real: torch.Tensor, fake: torch.Tensor, rng_seed: int = 0, n_projections=100
+    real: torch.Tensor,
+    fake: torch.Tensor,
+    rng_seed: int = 0,
+    n_projections=100,
+    projection_batch_size: int | None = None,
 ) -> torch.Tensor:
     """Monge Inception distance (MIND) between two sets of feature vectors.
 
@@ -92,6 +96,10 @@ def monge_inception_distance(
         fake (torch.Tensor): synthetic features, shape (M, D).
         rng_seed (int): random seed for reproducibility.
         n_projections (int): number of projections to use.
+        projection_batch_size (int, optional): number of projections
+            processed at once, bounding the (N, batch) projected and
+            sorted buffers. All directions are drawn upfront, so the
+            result does not depend on it. None processes them all at once.
 
     Returns:
         torch.Tensor: scalar MIND.
@@ -106,12 +114,16 @@ def monge_inception_distance(
         (n_projections, d), generator=generator, dtype=real.dtype, device=real.device)
     u_proj = u_proj / u_proj.norm(dim=1, keepdim=True)
 
-    # (N, n_projections): sort each projection over the samples
-    x_proj = torch.sort(real @ u_proj.T, dim=0).values
-    y_proj = torch.sort(fake @ u_proj.T, dim=0).values
-    dists = torch.mean((x_proj - y_proj) ** 2, dim=0)
+    if projection_batch_size is None:
+        projection_batch_size = n_projections
+    dists = []
+    for u_batch in torch.split(u_proj, projection_batch_size):
+        # (N, batch): sort each projection over the samples
+        x_proj = torch.sort(real @ u_batch.T, dim=0).values
+        y_proj = torch.sort(fake @ u_batch.T, dim=0).values
+        dists.append(torch.mean((x_proj - y_proj) ** 2, dim=0))
 
-    return alpha * torch.mean(dists)
+    return alpha * torch.mean(torch.cat(dists))
 
 
 @register_distance

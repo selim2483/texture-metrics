@@ -294,6 +294,9 @@ class MIND(Metric):
         max_real_samples (int | float): maximum number of stored samples,
             applied to both real and fake features.
         n_projections (int): number of random projections.
+        projection_batch_size (int, optional): number of projections
+            processed at once, to bound memory with many samples. None
+            processes them all at once.
         rng_seed (int): seed of the random projections.
         name (str): metric name.
         compile (bool): whether to compile the feature extractor.
@@ -312,6 +315,7 @@ class MIND(Metric):
         value_range: tuple[float, float] = (0.0, 1.0),
         max_real_samples: int | float = math.inf,
         n_projections: int = 100,
+        projection_batch_size: Optional[int] = None,
         rng_seed: int = 0,
         name: str = "mind",
         compile: bool = True,
@@ -345,6 +349,7 @@ class MIND(Metric):
         self.vmin, self.vmax = value_range
         self.max_real_samples = max_real_samples
         self.n_projections = n_projections
+        self.projection_batch_size = projection_batch_size
         self.rng_seed = rng_seed
         self.name = name
 
@@ -400,6 +405,7 @@ class MIND(Metric):
             fakes[:n],
             rng_seed=self.rng_seed,
             n_projections=self.n_projections,
+            projection_batch_size=self.projection_batch_size,
         ).float()
         self.time = self.time + (time.time() - start_time)
         return result
